@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import os
@@ -1021,4 +1022,5 @@ if __name__ == "__main__":
 
     logger.info("Запуск бота...")
     logger.info("Важно: для команд без '/' в группах отключите privacy mode у бота в BotFather (/setprivacy -> Disable).")
+    asyncio.set_event_loop(asyncio.new_event_loop())
     bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
