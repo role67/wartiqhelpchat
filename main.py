@@ -199,15 +199,36 @@ def parse_numeric_id(value: str) -> int | None:
     return None
 
 
+def open_db_connection() -> psycopg.Connection:
+    conn = psycopg.connect(DATABASE_URL, autocommit=True)
+    return conn
+
+
+def reset_db_connection(application: Application) -> psycopg.Connection:
+    old_conn: psycopg.Connection | None = application.bot_data.pop(DB_CONN_KEY, None)
+    if old_conn is not None and not old_conn.closed:
+        try:
+            old_conn.close()
+        except psycopg.Error:
+            logger.warning("Failed to close stale database connection.", exc_info=True)
+
+    conn = open_db_connection()
+    application.bot_data[DB_CONN_KEY] = conn
+    return conn
+
+
 def db_conn(application: Application) -> psycopg.Connection:
     conn: psycopg.Connection | None = application.bot_data.get(DB_CONN_KEY)
     if conn is None:
         raise RuntimeError("Database is not initialized")
+    if conn.closed:
+        logger.warning("Database connection was closed; reconnecting.")
+        conn = reset_db_connection(application)
     return conn
 
 
 def init_db(application: Application) -> None:
-    conn = psycopg.connect(DATABASE_URL, autocommit=True)
+    conn = open_db_connection()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -270,7 +291,7 @@ def init_db(application: Application) -> None:
 
 
 def close_db(application: Application) -> None:
-    conn: psycopg.Connection | None = application.bot_data.get(DB_CONN_KEY)
+    conn: psycopg.Connection | None = application.bot_data.pop(DB_CONN_KEY, None)
     if conn is not None:
         conn.close()
 
@@ -991,6 +1012,17 @@ async def post_shutdown(application: Application) -> None:
     close_db(application)
 
 
+async def log_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    exc_info = (type(error), error, error.__traceback__) if error is not None else None
+    logger.error("Unhandled exception while processing update: %s", update, exc_info=exc_info)
+    if isinstance(error, psycopg.OperationalError):
+        try:
+            reset_db_connection(context.application)
+        except Exception:
+            logger.exception("Failed to reconnect database after OperationalError.")
+
+
 if __name__ == "__main__":
     if not BOT_TOKEN:
         raise RuntimeError(f"Set BOT_TOKEN in {ENV_PATH} before running the bot.")
@@ -1019,6 +1051,7 @@ if __name__ == "__main__":
     # Admin chat responses.
     bot_app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, route_admin_reply), group=1)
     bot_app.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern=r"^fb:(up|down):\d+$"))
+    bot_app.add_error_handler(log_error)
 
     logger.info("Запуск бота...")
     logger.info("Важно: для команд без '/' в группах отключите privacy mode у бота в BotFather (/setprivacy -> Disable).")
