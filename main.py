@@ -51,6 +51,7 @@ USER_SECTION_KEY = "selected_section"
 ROUTE_MAP_KEY = "route_map"
 HTTP_RUNNER_KEY = "http_runner"
 DB_CONN_KEY = "db_conn"
+DB_LAST_CHECK_KEY = "db_last_check"
 
 SECTION_PATTERN = re.compile(r"^(💬 Общение|🛟 Поддержка)$")
 FEEDBACK_CALLBACK_PATTERN = re.compile(r"^fb:(up|down):(\d+)$")
@@ -200,7 +201,15 @@ def parse_numeric_id(value: str) -> int | None:
 
 
 def open_db_connection() -> psycopg.Connection:
-    conn = psycopg.connect(DATABASE_URL, autocommit=True)
+    conn = psycopg.connect(
+        DATABASE_URL,
+        autocommit=True,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
     return conn
 
 
@@ -224,6 +233,21 @@ def db_conn(application: Application) -> psycopg.Connection:
     if conn.closed:
         logger.warning("Database connection was closed; reconnecting.")
         conn = reset_db_connection(application)
+        application.bot_data[DB_LAST_CHECK_KEY] = datetime.now()
+        return conn
+
+    # Validate long-lived connection periodically to avoid using stale SSL sessions.
+    last_check: datetime | None = application.bot_data.get(DB_LAST_CHECK_KEY)
+    should_check = last_check is None or (datetime.now() - last_check).total_seconds() >= 30
+    if should_check:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            application.bot_data[DB_LAST_CHECK_KEY] = datetime.now()
+        except psycopg.OperationalError:
+            logger.warning("Database connection became stale; reconnecting.", exc_info=True)
+            conn = reset_db_connection(application)
+            application.bot_data[DB_LAST_CHECK_KEY] = datetime.now()
     return conn
 
 
@@ -299,10 +323,8 @@ def close_db(application: Application) -> None:
 def upsert_user(application: Application, user: Any) -> None:
     if user is None:
         return
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
+    payload = (user.id, user.username, user.first_name, user.last_name, datetime.now())
+    query = """
             INSERT INTO users (user_id, username, first_name, last_name, updated_at)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT(user_id) DO UPDATE SET
@@ -310,9 +332,22 @@ def upsert_user(application: Application, user: Any) -> None:
                 first_name=excluded.first_name,
                 last_name=excluded.last_name,
                 updated_at=excluded.updated_at
-            """,
-            (user.id, user.username, user.first_name, user.last_name, datetime.now()),
-        )
+            """
+
+    try:
+        conn = db_conn(application)
+        with conn.cursor() as cur:
+            cur.execute(query, payload)
+    except psycopg.OperationalError:
+        logger.warning("upsert_user failed due to OperationalError, retrying with fresh connection.", exc_info=True)
+        try:
+            conn = reset_db_connection(application)
+            application.bot_data[DB_LAST_CHECK_KEY] = datetime.now()
+            with conn.cursor() as cur:
+                cur.execute(query, payload)
+        except psycopg.OperationalError:
+            # Don't break user-facing /start if the database is temporarily unavailable.
+            logger.error("upsert_user retry failed; skipping profile sync for this update.", exc_info=True)
 
 
 def find_user_id_by_username(application: Application, username: str) -> int | None:
