@@ -1,4 +1,4 @@
-﻿services:
+services:
   - type: web
     name: wartiqhelpchat
     runtime: python
@@ -6,7 +6,15 @@
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
-      - key: DISCORD_PUBLIC_KEY
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: COMMUNITY_CHAT_ID
+        sync: false
+      - key: SUPPORT_CHAT_ID
+        sync: false
+      - key: ADMIN_IDS
         sync: false
       - key: LOG_LEVEL
         value: INFO
