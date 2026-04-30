@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import psycopg
 from aiohttp import web
@@ -51,6 +51,7 @@ USER_SECTION_KEY = "selected_section"
 ROUTE_MAP_KEY = "route_map"
 HTTP_RUNNER_KEY = "http_runner"
 DB_CONN_KEY = "db_conn"
+DB_RETRY_ATTEMPTS = 2
 
 SECTION_PATTERN = re.compile(r"^(💬 Общение|🛟 Поддержка)$")
 FEEDBACK_CALLBACK_PATTERN = re.compile(r"^fb:(up|down):(\d+)$")
@@ -200,8 +201,15 @@ def parse_numeric_id(value: str) -> int | None:
 
 
 def open_db_connection() -> psycopg.Connection:
-    conn = psycopg.connect(DATABASE_URL, autocommit=True)
-    return conn
+    return psycopg.connect(
+        DATABASE_URL,
+        autocommit=True,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
 
 
 def reset_db_connection(application: Application) -> psycopg.Connection:
@@ -227,8 +235,7 @@ def db_conn(application: Application) -> psycopg.Connection:
     return conn
 
 
-def init_db(application: Application) -> None:
-    conn = open_db_connection()
+def init_db_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -287,58 +294,107 @@ def init_db(application: Application) -> None:
             """
         )
 
-    application.bot_data[DB_CONN_KEY] = conn
+
+def init_db(application: Application) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, DB_RETRY_ATTEMPTS + 1):
+        conn: psycopg.Connection | None = None
+        try:
+            conn = open_db_connection()
+            init_db_schema(conn)
+            application.bot_data[DB_CONN_KEY] = conn
+            return
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            last_error = exc
+            if conn is not None and not conn.closed:
+                try:
+                    conn.close()
+                except psycopg.Error:
+                    logger.warning("Failed to close database connection after init error.", exc_info=True)
+            if attempt >= DB_RETRY_ATTEMPTS:
+                break
+            logger.warning("Database initialization failed; reconnecting and retrying.", exc_info=True)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Database initialization did not complete")
 
 
 def close_db(application: Application) -> None:
     conn: psycopg.Connection | None = application.bot_data.pop(DB_CONN_KEY, None)
     if conn is not None:
-        conn.close()
+        try:
+            conn.close()
+        except psycopg.Error:
+            logger.warning("Failed to close database connection.", exc_info=True)
+
+
+def run_db_operation(application: Application, operation_name: str, operation: Callable[[psycopg.Connection], Any]) -> Any:
+    for attempt in range(1, DB_RETRY_ATTEMPTS + 1):
+        conn = db_conn(application)
+        try:
+            return operation(conn)
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            if attempt >= DB_RETRY_ATTEMPTS:
+                raise
+            logger.warning(
+                "Database operation %s failed because the connection was lost; reconnecting and retrying.",
+                operation_name,
+                exc_info=True,
+            )
+            reset_db_connection(application)
+
+    raise RuntimeError(f"Database operation {operation_name} did not complete")
 
 
 def upsert_user(application: Application, user: Any) -> None:
     if user is None:
         return
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO users (user_id, username, first_name, last_name, updated_at)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                first_name=excluded.first_name,
-                last_name=excluded.last_name,
-                updated_at=excluded.updated_at
-            """,
-            (user.id, user.username, user.first_name, user.last_name, datetime.now()),
-        )
+
+    def operation(conn: psycopg.Connection) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    first_name=excluded.first_name,
+                    last_name=excluded.last_name,
+                    updated_at=excluded.updated_at
+                """,
+                (user.id, user.username, user.first_name, user.last_name, datetime.now()),
+            )
+
+    run_db_operation(application, "upsert_user", operation)
 
 
 def find_user_id_by_username(application: Application, username: str) -> int | None:
     normalized = username.lstrip("@").lower()
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT user_id FROM users
-            WHERE username IS NOT NULL AND LOWER(username)=%s
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (normalized,),
-        )
-        row = cur.fetchone()
+    def operation(conn: psycopg.Connection) -> Any:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_id FROM users
+                WHERE username IS NOT NULL AND LOWER(username)=%s
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (normalized,),
+            )
+            return cur.fetchone()
 
+    row = run_db_operation(application, "find_user_id_by_username", operation)
     return int(row[0]) if row else None
 
 
 def is_banned(application: Application, user_id: int) -> tuple[bool, str]:
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute("SELECT reason FROM bans WHERE user_id=%s", (user_id,))
-        row = cur.fetchone()
+    def operation(conn: psycopg.Connection) -> Any:
+        with conn.cursor() as cur:
+            cur.execute("SELECT reason FROM bans WHERE user_id=%s", (user_id,))
+            return cur.fetchone()
 
+    row = run_db_operation(application, "is_banned", operation)
     if not row:
         return False, ""
 
@@ -347,27 +403,31 @@ def is_banned(application: Application, user_id: int) -> tuple[bool, str]:
 
 
 def set_ban(application: Application, user_id: int, reason: str, by_user_id: int, by_chat_id: int) -> None:
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO bans (user_id, reason, banned_at, banned_by, banned_in_chat)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT(user_id) DO UPDATE SET
-                reason=excluded.reason,
-                banned_at=excluded.banned_at,
-                banned_by=excluded.banned_by,
-                banned_in_chat=excluded.banned_in_chat
-            """,
-            (user_id, reason or "", datetime.now(), by_user_id, by_chat_id),
-        )
+    def operation(conn: psycopg.Connection) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bans (user_id, reason, banned_at, banned_by, banned_in_chat)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    reason=excluded.reason,
+                    banned_at=excluded.banned_at,
+                    banned_by=excluded.banned_by,
+                    banned_in_chat=excluded.banned_in_chat
+                """,
+                (user_id, reason or "", datetime.now(), by_user_id, by_chat_id),
+            )
+
+    run_db_operation(application, "set_ban", operation)
 
 
 def remove_ban(application: Application, user_id: int) -> bool:
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM bans WHERE user_id=%s", (user_id,))
-        return cur.rowcount > 0
+    def operation(conn: psycopg.Connection) -> bool:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM bans WHERE user_id=%s", (user_id,))
+            return cur.rowcount > 0
+
+    return bool(run_db_operation(application, "remove_ban", operation))
 
 
 def save_route(
@@ -379,22 +439,23 @@ def save_route(
 ) -> int:
     route_map: dict[str, dict[str, int]] = application.bot_data.setdefault(ROUTE_MAP_KEY, {})
 
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO routes (admin_chat_id, admin_message_id, user_id, user_message_id, created_at)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (admin_chat_id, admin_message_id) DO UPDATE SET
-                user_id=excluded.user_id,
-                user_message_id=excluded.user_message_id,
-                created_at=excluded.created_at
-            RETURNING ticket_id
-            """,
-            (admin_chat_id, admin_message_id, user_id, user_message_id, datetime.now()),
-        )
-        row = cur.fetchone()
+    def operation(conn: psycopg.Connection) -> Any:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO routes (admin_chat_id, admin_message_id, user_id, user_message_id, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (admin_chat_id, admin_message_id) DO UPDATE SET
+                    user_id=excluded.user_id,
+                    user_message_id=excluded.user_message_id,
+                    created_at=excluded.created_at
+                RETURNING ticket_id
+                """,
+                (admin_chat_id, admin_message_id, user_id, user_message_id, datetime.now()),
+            )
+            return cur.fetchone()
 
+    row = run_db_operation(application, "save_route", operation)
     ticket_id = int(row[0]) if row else admin_message_id
     route_map[f"{admin_chat_id}:{admin_message_id}"] = {
         "user_id": user_id,
@@ -416,14 +477,15 @@ def get_route_user_id(application: Application, admin_chat_id: int, admin_messag
     if cached:
         return cached["user_id"]
 
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT user_id, ticket_id, user_message_id FROM routes WHERE admin_chat_id=%s AND admin_message_id=%s",
-            (admin_chat_id, admin_message_id),
-        )
-        row = cur.fetchone()
+    def operation(conn: psycopg.Connection) -> Any:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, ticket_id, user_message_id FROM routes WHERE admin_chat_id=%s AND admin_message_id=%s",
+                (admin_chat_id, admin_message_id),
+            )
+            return cur.fetchone()
 
+    row = run_db_operation(application, "get_route_user_id", operation)
     if not row:
         return None
 
@@ -447,13 +509,15 @@ def get_ticket_id_by_admin_message(application: Application, admin_chat_id: int,
     if cached and "ticket_id" in cached:
         return int(cached["ticket_id"])
 
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT ticket_id, user_id, user_message_id FROM routes WHERE admin_chat_id=%s AND admin_message_id=%s",
-            (admin_chat_id, admin_message_id),
-        )
-        row = cur.fetchone()
+    def operation(conn: psycopg.Connection) -> Any:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticket_id, user_id, user_message_id FROM routes WHERE admin_chat_id=%s AND admin_message_id=%s",
+                (admin_chat_id, admin_message_id),
+            )
+            return cur.fetchone()
+
+    row = run_db_operation(application, "get_ticket_id_by_admin_message", operation)
     if not row:
         return None
 
@@ -476,14 +540,15 @@ def get_route_user_id_by_ticket(application: Application, admin_chat_id: int, ti
     if cached:
         return cached["user_id"]
 
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT user_id, admin_message_id, user_message_id FROM routes WHERE admin_chat_id=%s AND ticket_id=%s",
-            (admin_chat_id, ticket_id),
-        )
-        row = cur.fetchone()
+    def operation(conn: psycopg.Connection) -> Any:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, admin_message_id, user_message_id FROM routes WHERE admin_chat_id=%s AND ticket_id=%s",
+                (admin_chat_id, ticket_id),
+            )
+            return cur.fetchone()
 
+    row = run_db_operation(application, "get_route_user_id_by_ticket", operation)
     if not row:
         return None
 
@@ -505,13 +570,15 @@ def get_user_message_id_by_ticket(application: Application, admin_chat_id: int, 
     if cached and cached.get("user_message_id") is not None:
         return int(cached["user_message_id"])
 
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT user_message_id FROM routes WHERE admin_chat_id=%s AND ticket_id=%s",
-            (admin_chat_id, ticket_id),
-        )
-        row = cur.fetchone()
+    def operation(conn: psycopg.Connection) -> Any:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_message_id FROM routes WHERE admin_chat_id=%s AND ticket_id=%s",
+                (admin_chat_id, ticket_id),
+            )
+            return cur.fetchone()
+
+    row = run_db_operation(application, "get_user_message_id_by_ticket", operation)
     if not row or row[0] is None:
         return None
     return int(row[0])
@@ -523,13 +590,15 @@ def get_user_message_id_by_admin_message(application: Application, admin_chat_id
     if cached and cached.get("user_message_id") is not None:
         return int(cached["user_message_id"])
 
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT user_message_id FROM routes WHERE admin_chat_id=%s AND admin_message_id=%s",
-            (admin_chat_id, admin_message_id),
-        )
-        row = cur.fetchone()
+    def operation(conn: psycopg.Connection) -> Any:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_message_id FROM routes WHERE admin_chat_id=%s AND admin_message_id=%s",
+                (admin_chat_id, admin_message_id),
+            )
+            return cur.fetchone()
+
+    row = run_db_operation(application, "get_user_message_id_by_admin_message", operation)
     if not row or row[0] is None:
         return None
     return int(row[0])
@@ -542,50 +611,62 @@ def claim_route_answer(
     answered_by: int,
     answer_message_id: int,
 ) -> tuple[str, int | None, int | None, int | None]:
-    conn = db_conn(application)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE routes
-            SET answered_at=%s,
-                answered_by=%s,
-                answer_message_id=%s
-            WHERE admin_chat_id=%s
-              AND admin_message_id=%s
-              AND answered_at IS NULL
-            RETURNING user_id, ticket_id, user_message_id
-            """,
-            (datetime.now(), answered_by, answer_message_id, admin_chat_id, admin_message_id),
-        )
-        row = cur.fetchone()
-        if row:
-            return "claimed", int(row[0]), int(row[1]), int(row[2]) if row[2] is not None else None
+    def operation(conn: psycopg.Connection) -> tuple[str, int | None, int | None, int | None]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE routes
+                SET answered_at=%s,
+                    answered_by=%s,
+                    answer_message_id=%s
+                WHERE admin_chat_id=%s
+                  AND admin_message_id=%s
+                  AND answered_at IS NULL
+                RETURNING user_id, ticket_id, user_message_id
+                """,
+                (datetime.now(), answered_by, answer_message_id, admin_chat_id, admin_message_id),
+            )
+            row = cur.fetchone()
+            if row:
+                return "claimed", int(row[0]), int(row[1]), int(row[2]) if row[2] is not None else None
 
-        cur.execute(
-            "SELECT answered_at FROM routes WHERE admin_chat_id=%s AND admin_message_id=%s",
-            (admin_chat_id, admin_message_id),
-        )
-        existing = cur.fetchone()
+            cur.execute(
+                """
+                SELECT answered_by, answer_message_id, user_id, ticket_id, user_message_id
+                FROM routes
+                WHERE admin_chat_id=%s AND admin_message_id=%s
+                """,
+                (admin_chat_id, admin_message_id),
+            )
+            existing = cur.fetchone()
 
-    if existing:
-        return "answered", None, None, None
-    return "not_found", None, None, None
+        if existing:
+            existing_answered_by = int(existing[0]) if existing[0] is not None else None
+            existing_answer_message_id = int(existing[1]) if existing[1] is not None else None
+            if existing_answered_by == answered_by and existing_answer_message_id == answer_message_id:
+                return "claimed", int(existing[2]), int(existing[3]), int(existing[4]) if existing[4] is not None else None
+            return "answered", None, None, None
+        return "not_found", None, None, None
+
+    return run_db_operation(application, "claim_route_answer", operation)
 
 
 def save_feedback_vote(application: Application, ticket_id: int, user_id: int, vote: str) -> None:
-    conn = db_conn(application)
-    now = datetime.now()
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO feedback_votes (ticket_id, user_id, vote, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (ticket_id, user_id) DO UPDATE SET
-                vote=excluded.vote,
-                updated_at=excluded.updated_at
-            """,
-            (ticket_id, user_id, vote, now, now),
-        )
+    def operation(conn: psycopg.Connection) -> None:
+        now = datetime.now()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO feedback_votes (ticket_id, user_id, vote, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (ticket_id, user_id) DO UPDATE SET
+                    vote=excluded.vote,
+                    updated_at=excluded.updated_at
+                """,
+                (ticket_id, user_id, vote, now, now),
+            )
+
+    run_db_operation(application, "save_feedback_vote", operation)
 
 
 async def is_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
